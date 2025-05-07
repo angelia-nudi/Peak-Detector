@@ -1,0 +1,541 @@
+
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use ieee.numeric_std.all;
+use work.common_pack.all;
+use ieee.std_logic_signed.all;
+library UNISIM;
+use UNISIM.VComponents.all;
+
+entity cmdProc is
+port (
+    clk:		in std_logic;
+    reset:        in std_logic;
+    rxnow:        in std_logic; -- dataReady (Receiver)
+    rxData:            in std_logic_vector (7 downto 0); 
+    txData:            out std_logic_vector (7 downto 0);-- A register that contains the whole data packet to be sent, including start and stop bits. 
+    rxdone:        out std_logic;  -- Tell receiver to send next data packet (active high)
+    ovErr:        in std_logic; -- Too much data (Receiver)
+    framErr:    in std_logic; -- Wrong data (Receiver)
+    txnow:        out std_logic; -- Ready to send data to transmitter (sends hight for 1 clock cycle)
+    txdone:        in std_logic; -- Transmitter done transmitting
+    start: out std_logic; -- Send for dataConsume to iterate through the next data packet
+    numWords_bcd: out BCD_ARRAY_TYPE(2 downto 0); -- 12 bits
+    dataReady: in std_logic; -- from dataConsumer
+    byte: in std_logic_vector(7 downto 0); -- the latest 8 bits , valid when dataready=1
+    maxIndex: in BCD_ARRAY_TYPE(2 downto 0); -- 12 bits
+    dataResults: in CHAR_ARRAY_TYPE(0 to RESULT_BYTE_NUM-1); -- 6 bytes
+    seqDone: in std_logic --from dataconsumer
+    );
+end cmdProc;
+
+architecture Behavioral of cmdProc is
+    type state_type is (INIT, A,AN,ANN,ANNN, CONSUME_DONE, P, L, peak_first_letter, peak_second_letter, peak_space, peak_index, list_first_letter, list_second_letter, list_space, LF, CR,reset_state, rxD_state, start_state, tx_state, txd_state,wait_for_txdone_state);
+    signal curState, nextState: state_type;
+    signal valid, done: std_logic;
+    signal byte_reg: std_logic_vector(7 downto 0);
+    signal bit_counter: integer := 0;
+    signal txByte : std_logic;
+    signal annn_shift: std_logic:='0';
+    signal annn_reg: std_logic_vector(7 downto 0);
+    -- Declare a signal to indicate when txnow is high
+    signal txnow_high : std_logic := '0';
+    -- Define a type for the BCD-to-ASCII lookup table
+    type BCD_ASCII_Table is array (0 to 15) of std_logic_vector(7 downto 0);
+    
+    signal rxData_reg : std_logic_vector(7 downto 0); -- Holds data for checking
+    signal peak_counter: integer;
+    signal en_peak_counter: bit;
+    signal list_counter: integer;
+    signal en_list_counter: bit;
+    signal annn_hold : std_logic_vector(7 downto 0);
+    -- Define the lookup table for BCD-to-ASCII conversion
+    constant BCD_to_ASCII_LUT : BCD_ASCII_Table := (
+        -- BCD 0000 to ASCII '0'
+        "00110000", -- '0'
+        -- BCD 0001 to ASCII '1'
+        "00110001", -- '1'
+        -- BCD 0010 to ASCII '2'
+        "00110010", -- '2'
+        -- BCD 0011 to ASCII '3'
+        "00110011", -- '3'
+        -- BCD 0100 to ASCII '4'
+        "00110100", -- '4'
+        -- BCD 0101 to ASCII '5'
+        "00110101", -- '5'
+        -- BCD 0110 to ASCII '6'
+        "00110110", -- '6'
+        -- BCD 0111 to ASCII '7'
+        "00110111", -- '7'
+        -- BCD 1000 to ASCII '8'
+        "00111000", -- '8'
+        -- BCD 1001 to ASCII '9'
+        "00111001", -- '9'
+        -- BCD 1010 to ASCII 'A'
+        "01000001", -- 'A'
+        -- BCD 1011 to ASCII 'B'
+        "01000010", -- 'B'
+        -- BCD 1100 to ASCII 'C'
+        "01000011", -- 'C'
+        -- BCD 1101 to ASCII 'D'
+        "01000100", -- 'D'
+        -- BCD 1110 to ASCII 'E'
+        "01000101", -- 'E'
+        -- BCD 1111 to ASCII 'F'
+        "01000110" -- 'F'    
+);
+
+    
+begin
+
+-- Process for holding data from the receiver
+rx_hold : process(clk)
+begin
+if rising_edge(clk) then
+-- no frame or overrun errors and it is new data from the receiver
+if ( framErr='0' and ovErr='0' and rxnow='1') then-- Check for good data
+    rxData_reg <= rxData; -- Place into register.
+end if;
+end if;
+end process;
+
+-- Process for the peak index operation (It's decremented each time the system processes a peek operation) 
+peak_index_counter: process(clk, reset)
+begin
+    if reset = '1' then
+        peak_counter <= 3; -- Initialize the counter to 3
+    elsif rising_edge(clk) then
+        if en_peak_counter = '1' then -- Check if counter should be enabled
+            if peak_counter > 1 then -- Check if counter is greater than 1 before decrementing
+                peak_counter <= peak_counter - 1; -- Decrement the counter
+            end if;
+        end if;
+    end if;
+end process;
+
+-- Process for recoding the number of data that has been listed
+list_index_counter: process(clk, reset)
+begin
+    if reset = '1' then
+        list_counter <= 7; -- Initialize the counter to 7
+    elsif rising_edge(clk) then
+        if en_list_counter = '1' then -- Check if counter should be enabled
+            if list_counter > 1 then -- Check if counter is greater than 1 before decrementing
+                list_counter <= list_counter - 1; -- Decrement the counter
+            end if;
+        end if;
+    end if;
+end process;
+
+
+--shifting the input from the terminal ?
+shift_process: process(reset, annn_shift, rxData, clk)
+begin
+    if reset = '1' then
+        annn_reg <= (others => '1'); -- Reset value
+    elsif rising_edge(clk) then
+        if annn_shift = '1' then
+            annn_reg <= '0' & annn_reg(7 downto 1); -- Shift left by one bit
+            annn_reg(0) <= rxData(0); -- Assign new value to the zero bit
+        end if;
+    end if;
+end process;
+
+-- Process where actions are triggered based on txdone
+process(clk)
+begin
+    if rising_edge(clk) then
+        if txdone = '1' then
+            -- Perform actions when transmission is complete
+            if curState = wait_for_txdone_state then
+                -- All bytes have been transmitted, so stop transmission
+                txNow <= '0';
+                -- Transition back to start_state
+                nextState <= start_state;
+            end if;
+        end if;
+    end if;
+end process;  
+
+
+
+-- Clock logic
+    process(clk, reset)
+    begin
+        if reset = '1' then
+            -- Reset state machine
+            curState <= reset_state;
+            
+        elsif rising_edge(clk) then
+            -- Update current state based on next state
+            curState <= nextState;
+        end if;
+    end process;
+    
+    
+
+
+
+
+
+-- State outputs here.
+logic_StateOut: process(curState)
+begin
+
+    case curState is
+        when INIT =>
+            numWords_bcd(0) <= "0000";
+            numWords_bcd(1) <= "0000";
+            numwords_bcd(2) <= "0000";
+                 
+        when A => -- Check for numbers, placing into register is in output state
+            case rxData_reg is
+                when "00110000" => numWords_bcd(2) <= rxData_reg(3 downto 0); --0 
+                when "00110001" => numWords_bcd(2) <= rxData_reg(3 downto 0); --1 
+                when "00110010" => numWords_bcd(2) <= rxData_reg(3 downto 0); --2 
+                when "00110011" => numWords_bcd(2) <= rxData_reg(3 downto 0); --3
+                when "00110100" => numWords_bcd(2) <= rxData_reg(3 downto 0); --4
+                when "00110101" => numWords_bcd(2) <= rxData_reg(3 downto 0); --5
+                when "00110110" => numWords_bcd(2) <= rxData_reg(3 downto 0); --6
+                when "00110111" => numWords_bcd(2) <= rxData_reg(3 downto 0); --7
+                when "00111000" => numWords_bcd(2) <= rxData_reg(3 downto 0); --8
+                when "00111001" => numWords_bcd(2) <= rxData_reg(3 downto 0); --9
+                when others     => numWords_bcd(2) <= "0000";
+                end case;
+
+        when AN =>
+            case rxData_reg is
+                when "00110000" => numWords_bcd(1) <= rxData_reg(3 downto 0); --0 
+                when "00110001" => numWords_bcd(1) <= rxData_reg(3 downto 0); --1 
+                when "00110010" => numWords_bcd(1) <= rxData_reg(3 downto 0); --2 
+                when "00110011" => numWords_bcd(1) <= rxData_reg(3 downto 0); --3
+                when "00110100" => numWords_bcd(1) <= rxData_reg(3 downto 0); --4
+                when "00110101" => numWords_bcd(1) <= rxData_reg(3 downto 0); --5
+                when "00110110" => numWords_bcd(1) <= rxData_reg(3 downto 0); --6
+                when "00110111" => numWords_bcd(1) <= rxData_reg(3 downto 0); --7
+                when "00111000" => numWords_bcd(1) <= rxData_reg(3 downto 0); --8
+                when "00111001" => numWords_bcd(1) <= rxData_reg(3 downto 0); --9
+                when others     => numWords_bcd(1) <= "0000";
+                end case;
+
+        when ANN =>
+            case rxData_reg is
+                when "00110000" => numWords_bcd(0) <= rxData_reg(3 downto 0); --0 
+                when "00110001" => numWords_bcd(0) <= rxData_reg(3 downto 0); --1 
+                when "00110010" => numWords_bcd(0) <= rxData_reg(3 downto 0); --2 
+                when "00110011" => numWords_bcd(0) <= rxData_reg(3 downto 0); --3
+                when "00110100" => numWords_bcd(0) <= rxData_reg(3 downto 0); --4
+                when "00110101" => numWords_bcd(0) <= rxData_reg(3 downto 0); --5
+                when "00110110" => numWords_bcd(0) <= rxData_reg(3 downto 0); --6
+                when "00110111" => numWords_bcd(0) <= rxData_reg(3 downto 0); --7
+                when "00111000" => numWords_bcd(0) <= rxData_reg(3 downto 0); --8
+                when "00111001" => numWords_bcd(0) <= rxData_reg(3 downto 0); --9
+                when others     => numWords_bcd(0)  <= "0000";
+                end case;
+        when ANNN =>
+            -- Assume all data has been added already and is ready to send to the Data Processor
+            start <= '1';
+            annn_hold <= rxData_reg;
+
+    
+  -------------------------------------------------------------------------------------------------------------------------------------------------------
+   -- printing the 'p' command    
+            -- An example of using the look up table for BCD to ASCII conversion:
+        WHEN peak_first_letter =>
+            txData <= BCD_to_ASCII_LUT(to_integer(unsigned(dataResults(3)(7 downto 4)))); -- the ASCII representation of the first four bit of the data received
+        
+        WHEN peak_second_letter => 
+            txData <= BCD_to_ASCII_LUT(to_integer(unsigned(dataResults(3)(3 downto 0))));-- the ASCII representation of the second four bit of the data received
+        
+        WHEN peak_space => 
+            txData <= "00100000"; -- the ASCII representation of space
+                
+        WHEN peak_index =>
+            txData <= BCD_to_ASCII_LUT(to_integer(unsigned(maxIndex(peak_counter-1))));-- The index value according to the counter
+            IF peak_counter <= 1 THEN
+               en_peak_counter <= '0';
+            ELSE
+               en_peak_counter <= '1';
+            END IF;      
+ --------------------------------------------------------------------------------------------------------------------------------------------------------
+ -- printing the 'L' command       
+        WHEN list_first_letter =>
+            txData <= BCD_to_ASCII_LUT(to_integer(unsigned(dataResults(list_counter-1)(7 downto 4))));-- the ASCII representation of the first four bit of the intended byte
+                
+        WHEN list_second_letter =>
+            txData <= BCD_to_ASCII_LUT(to_integer(unsigned(dataResults(list_counter-1)(3 downto 0)))); -- the ASCII representation of the second four bit of the intended byte
+            IF list_counter <= 1 THEN
+               en_list_counter <= '0';
+            ELSE
+               en_list_counter <= '1';
+            END IF;    
+        WHEN list_space =>
+            txData <= "00100000"; -- the ASCII representation of space
+  -------------------------------------------------------------------------------------------------------------------------------------------------------
+  -- formatting the output display          
+        WHEN LF =>
+            txData <= "00001010"; -- the ASCII representation of line feed
+                
+        WHEN CR =>
+            txData <= "00001101"; -- the ASCII representation of carriage return
+        
+        WHEN OTHERS =>
+            null;          
+    end case;
+end process;
+
+    
+ 
+    
+    
+    
+    
+    
+    
+
+    -- Sequential logic 
+    process(curState, byte,bit_counter,dataresults ,dataReady, seqDone, txDone,rxnow,rxdata)
+    begin
+            valid <= '0';
+            done <= '0';
+            byte_reg <= (others => '0');
+            bit_counter <= 0;
+            rxDone <= '0';
+            txNow <= '0';
+            annn_shift <='0';
+            txnow <='0';
+        case curState is
+            when reset_state =>
+                -- Wait for valid input on reset
+                if rxnow = '1' then  -- Use rxnow instead of rxD
+                    valid <= '1';
+                    nextState <= rxD_state;
+                else
+                    nextState <= reset_state;
+                end if;
+                
+              when rxd_state =>
+                if txnow_high = '1' then
+                    if (rxData_reg = "01000001" or rxData_reg = "01100001") then
+                    annn_shift <= '1';
+                    txData <= rxData;
+                    nextState <= A;  --what state ? to check the validation of nnn
+                else
+                    nextState <= rxd_state;
+                end if;
+                    end if;
+          
+                if bit_counter < 8 then
+        txByte <= annn_hold(7); -- Extract the MSB (bit 7) of the annn_temp signal
+        bit_counter <= bit_counter + 1;
+        nextState <= rxD_STATE;  -- Stay in the rxD_STATE to continue sending the remaining bits
+    else
+        done <= '1';  -- All 8 bits have been sent, indicate completion
+        nextState <= tx_state;  -- Transition to tx_state
+    end if;
+            when A => -- Check for numbers, placing into register is in output state
+            case rxData_reg is
+                when "00110000" => nextState <= AN; --0 
+                when "00110001" => nextState <= AN; --1 
+                when "00110010" => nextState <= AN; --2 
+                when "00110011" => nextState <= AN; --3
+                when "00110100" => nextState <= AN; --4
+                when "00110101" => nextState <= AN; --5
+                when "00110110" => nextState <= AN; --6
+                when "00110111" => nextState <= AN; --7
+                when "00111000" => nextState <= AN; --8
+                when "00111001" => nextState <= AN; --9
+                when others => nextState <= reset_state;
+                end case;
+           
+            when AN =>
+            case rxData_reg is
+                when "00110000" => nextState <= ANN; --0 
+                when "00110001" => nextState <= ANN; --1 
+                when "00110010" => nextState <= ANN; --2 
+                when "00110011" => nextState <= ANN; --3
+                when "00110100" => nextState <= ANN; --4
+                when "00110101" => nextState <= ANN; --5
+                when "00110110" => nextState <= ANN; --6
+                when "00110111" => nextState <= ANN; --7
+                when "00111000" => nextState <= ANN; --8
+                when "00111001" => nextState <= ANN; --9
+                when others => nextState <= reset_state;
+                end case;
+            
+             when ANN =>
+            case rxData_reg is
+                when "00110000" => nextState <= ANNN; --0 
+                when "00110001" => nextState <= ANNN; --1 
+                when "00110010" => nextState <= ANNN; --2 
+                when "00110011" => nextState <= ANNN; --3
+                when "00110100" => nextState <= ANNN; --4
+                when "00110101" => nextState <= ANNN; --5
+                when "00110110" => nextState <= ANNN; --6
+                when "00110111" => nextState <= ANNN; --7
+                when "00111000" => nextState <= ANNN; --8
+                when "00111001" => nextState <= ANNN; --9
+                when others => nextState <= reset_state;
+                end case;
+            when ANNN => -- Should wait till all data has been sent then move to state where data is being sent to Tx
+             annn_hold <= rxData_reg;
+             nextState <= rxD_STATE;
+           
+           
+                
+           when start_state =>
+    if dataReady = '1' then 
+        -- Trigger the transmission loop when dataReady is high
+        txNow <= '1';
+        for i in 0 to byte'length - 1 loop
+            -- Transmit each byte in the loop
+            txByte <= byte(i); 
+            -- Set the next state to wait for transmission completion
+            nextState <= wait_for_txdone_state;
+            -- Exit the loop and wait for the next clock cycle
+            exit;
+        end loop;
+    elsif seqDone = '1' and (rxData ="1001100" or rxData = "1110000") then --the numbers represents L or P i need to check this 
+        bit_counter <= 0;
+        txNow <= '0';
+
+        if txdone = '1' then
+            if bit_counter < 56 then
+                -- Transmit one bit per clock cycle until all bits are transmitted
+                txData <= dataResults(bit_counter) ;
+                txNow <= '1';
+                bit_counter <= bit_counter + 1;
+
+            end if;
+        end if;
+-- Check if transmission of all bits is completed
+        if bit_counter >= 56 then
+            -- Signal transmission completion after all bits are sent
+            nextState <= txd_state;
+        end if;
+    else 
+        -- If dataReady is not high or seqDone condition not met, stay in the start_state
+        nextState <= start_state;
+    end if;
+    
+
+
+when wait_for_txdone_state =>
+    -- Wait until transmission of the current byte is complete
+    if txDone = '1' then
+        -- All bytes have been transmitted, so stop transmission
+        txNow <= '0';
+        -- Transition back to start_state
+        nextState <= start_state;
+    else
+        -- Keep waiting for txDone to become '1'
+        nextState <= wait_for_txdone_state;
+    end if;
+
+
+                
+            when tx_state =>
+                -- Logic for tx state
+                if txDone = '1' then
+                    txNow <= '0';
+                    nextState <= txd_state;
+                else
+                    nextState <= tx_state;
+                end if;
+          
+          when P => -- Process for sending peak
+            nextState <= peak_first_letter;
+
+        when L =>
+            nextState <= list_first_letter;
+       
+         WHEN peak_first_letter =>
+            IF txdone ='1' THEN
+                txnow <= '1';
+                nextState <= peak_second_letter;
+            ELSE
+                nextState <= peak_first_letter;
+            END IF;
+            
+          WHEN peak_second_letter => 
+            IF txdone ='1' THEN
+                txnow <= '1';
+              
+                nextState <= peak_space;
+            ELSE
+                nextState <= peak_second_letter;
+            END IF;
+            
+            WHEN peak_space =>
+                IF txdone ='1' THEN
+                    txnow <= '1';
+                    nextState <= peak_index;
+                ELSE
+                    nextState <= peak_space;
+                END IF;
+                
+            WHEN peak_index =>
+                IF txdone ='1' THEN
+                    txnow <= '1';
+                    IF peak_counter = 1 THEN
+                        nextState <= LF;
+                    ELSE
+                        nextState <= peak_index;
+                    END IF;
+                 ELSE
+                    nextState <= peak_index;
+                 END IF;
+            
+            WHEN list_first_letter =>
+                IF txdone ='1' THEN
+                    txnow <= '1';
+                    nextState <= list_second_letter;
+                ELSE 
+                    nextState <= list_first_letter;
+                END IF;
+                
+            WHEN list_second_letter =>
+                IF txdone ='1' THEN
+                    txnow <= '1';
+                    nextState <= list_space;
+                ELSE 
+                    nextState <= list_second_letter;
+                END IF;
+                
+            WHEN list_space =>
+                 IF txdone ='1' THEN
+                    txnow <= '1';
+                    -- now the list counter comes in use
+                    IF list_counter = 1 THEN  -- Finished listing all the seven byte
+                        nextState <= LF;
+                    ELSE
+                        nextState <= list_first_letter;
+                    END IF;
+                  ELSE
+                    nextState <= list_space;
+                  END IF;
+                  
+            WHEN LF =>
+                IF txdone ='1' THEN
+                    txnow <= '1';
+                    nextState <= CR;
+                ELSE
+                    nextState <= LF;
+                END IF;
+                   
+            WHEN CR =>
+                IF txdone ='1' THEN
+                    txnow <= '1';
+                    rxdone <= '1';
+                    nextState <= INIT;
+                 ELSE
+                    nextState <= CR;
+                 END IF;
+ 
+        WHEN others => 
+           nextState <= reset_state;     
+
+        end case;
+    end process;
+
+end Behavioral;
